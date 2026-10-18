@@ -1,0 +1,16 @@
+[package]
+name = "gsr-tooling"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Macro compression for Tapleaf 0xC2 (GSR) scripts"
+license = "MIT"
+repository = "https://github.com/bitcoin-gsr/gsr-tooling"
+readme = "README.md"
+
+[[bin]]
+name = "gsr"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
