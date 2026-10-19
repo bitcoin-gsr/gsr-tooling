@@ -1,9 +1,10 @@
 //! Script encoding: reusable-macro declarations and references, CompactSize, instruction boundaries.
 
+use crate::opcodes::{Class, Opcode, OP_CALLMACRO, OP_MACRO};
 use crate::Error;
 
-pub const OP_MACRO: u8 = 0xD0;
-pub const OP_CALLMACRO: u8 = 0xD1;
+const MACRO: u8 = OP_MACRO.to_u8();
+const CALLMACRO: u8 = OP_CALLMACRO.to_u8();
 
 /// Length of the canonical CompactSize encoding of `n`.
 pub fn compact_len(n: u64) -> usize {
@@ -60,23 +61,27 @@ pub enum Token<'a> {
     Call(usize),
 }
 
-/// The tokens of one body or of the main script, with their offsets in it.
-fn tokens(code: &[u8], base: usize) -> Result<Vec<(Token<'_>, usize)>, Error> {
-    let mut out = Vec::new();
+/// Appends the tokens of one body or of the main script to `out`, with their offsets in it, up to the first
+/// instruction that does not decode. `base` is the offset of `code` in the script, `declared` the number of
+/// declarations a reference may name.
+fn tokens<'a>(code: &'a [u8], base: usize, declared: usize, out: &mut Vec<(Token<'a>, usize)>) -> Result<(), Error> {
     let mut p = 0;
     while p < code.len() {
         let op = code[p];
-        let (token, end) = match op {
-            OP_CALLMACRO => {
+        let (token, end) = match Opcode::from_u8(op).class() {
+            Class::Macro if op == CALLMACRO => {
                 let (index, end) = read_compact(code, p + 1).map_err(|e| e.offset_by(base))?;
+                if index >= declared as u64 {
+                    return Err(Error::UndeclaredMacro { offset: base + p, index: index as usize });
+                }
                 (Token::Call(index as usize), end)
             }
-            OP_MACRO => return Err(Error::MisplacedDeclaration(base + p)),
-            _ => {
-                let end = match op {
-                    1..=75 => p + 1 + op as usize,
-                    0x4C..=0x4E => {
-                        let width = [1, 2, 4][(op - 0x4C) as usize];
+            Class::Macro => return Err(Error::MisplacedDeclaration(base + p)),
+            class => {
+                let end = match class {
+                    Class::PushBytes(n) => p + 1 + n as usize,
+                    Class::PushData(width) => {
+                        let width = width as usize;
                         let mut le = [0u8; 4];
                         le[..width].copy_from_slice(code.get(p + 1..p + 1 + width).ok_or(Error::Truncated(base + p))?);
                         p + 1 + width + u32::from_le_bytes(le) as usize
@@ -89,7 +94,7 @@ fn tokens(code: &[u8], base: usize) -> Result<Vec<(Token<'_>, usize)>, Error> {
         out.push((token, p));
         p = end;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// A script split into its macro declarations and its main script, each tokenized. Well formed: declarations come
@@ -99,34 +104,49 @@ pub struct Decoded<'a> {
     pub main: Vec<(Token<'a>, usize)>,
     /// Offset of the main script: the length of the declarations.
     pub main_offset: usize,
+    pub declarations: Vec<Span>,
+}
+
+/// Where a declaration is: its `OP_MACRO` at `at`, its body from `body` to `end`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub at: usize,
+    pub body: usize,
+    pub end: usize,
 }
 
 pub fn decode(script: &[u8]) -> Result<Decoded<'_>, Error> {
-    let mut bodies = Vec::new();
+    match decode_prefix(script) {
+        (d, None) => Ok(d),
+        (_, Some(e)) => Err(e),
+    }
+}
+
+/// Decodes as consensus does, in serialized order, up to the first failure -> (what decoded before it, the
+/// failure). A body cut short by the failure keeps its tokens before it.
+pub fn decode_prefix(script: &[u8]) -> (Decoded<'_>, Option<Error>) {
+    let mut d = Decoded { bodies: Vec::new(), main: Vec::new(), main_offset: 0, declarations: Vec::new() };
     let mut i = 0;
-    while i < script.len() && script[i] == OP_MACRO {
-        let (n, j) = read_compact(script, i + 1)?;
-        let body = script.get(j..j + n as usize).ok_or(Error::Truncated(i))?;
-        let toks = tokens(body, j)?;
-        for &(t, p) in &toks {
-            if let Token::Call(k) = t {
-                if k >= bodies.len() {
-                    return Err(Error::UndeclaredMacro { offset: j + p, index: k });
-                }
-            }
+    while i < script.len() && script[i] == MACRO {
+        let (n, j) = match read_compact(script, i + 1) {
+            Ok(x) => x,
+            Err(e) => return (d, Some(e)),
+        };
+        let Some(body) = script.get(j..).filter(|rest| rest.len() as u64 >= n).map(|rest| &rest[..n as usize]) else {
+            return (d, Some(Error::Truncated(i)));
+        };
+        let mut toks = Vec::new();
+        let decoded = tokens(body, j, d.bodies.len(), &mut toks);
+        d.bodies.push(toks);
+        d.declarations.push(Span { at: i, body: j, end: j + body.len() });
+        if let Err(e) = decoded {
+            return (d, Some(e));
         }
-        bodies.push(toks);
-        i = j + n as usize;
+        i = j + body.len();
     }
-    let main = tokens(&script[i..], i)?;
-    for &(t, p) in &main {
-        if let Token::Call(k) = t {
-            if k >= bodies.len() {
-                return Err(Error::UndeclaredMacro { offset: i + p, index: k });
-            }
-        }
-    }
-    Ok(Decoded { bodies, main, main_offset: i })
+    d.main_offset = i;
+    let decoded = tokens(&script[i..], i, d.bodies.len(), &mut d.main);
+    (d, decoded.err())
 }
 
 impl Decoded<'_> {
@@ -164,10 +184,10 @@ mod tests {
     #[test]
     fn rejects_malformed_scripts() {
         // a reference to a later declaration, a truncated push, OP_MACRO after the declarations
-        assert!(matches!(decode(&[OP_MACRO, 2, OP_CALLMACRO, 0, 0x51]), Err(Error::UndeclaredMacro { .. })));
+        assert!(matches!(decode(&[MACRO, 2, CALLMACRO, 0, 0x51]), Err(Error::UndeclaredMacro { .. })));
         assert!(matches!(decode(&[0x05, 1, 2]), Err(Error::Truncated(0))));
-        assert!(matches!(decode(&[0x51, OP_MACRO, 0]), Err(Error::MisplacedDeclaration(1))));
-        let d = decode(&[OP_MACRO, 2, 0x51, 0x52, OP_CALLMACRO, 0, 0x93]).unwrap();
+        assert!(matches!(decode(&[0x51, MACRO, 0]), Err(Error::MisplacedDeclaration(1))));
+        let d = decode(&[MACRO, 2, 0x51, 0x52, CALLMACRO, 0, 0x93]).unwrap();
         assert_eq!(d.unroll(), vec![0x51, 0x52, 0x93]);
         assert_eq!(d.main_offset, 4);
     }

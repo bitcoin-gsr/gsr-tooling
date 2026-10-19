@@ -1,16 +1,27 @@
 [package]
-name = "gsr-tooling"
+name = "gsr"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
-description = "Macro compression for Tapleaf 0xC2 (GSR) scripts"
+description = "Tools for Tapleaf 0xC2 (GSR) scripts: opcodes, checks, macro compression"
 license = "MIT"
 repository = "https://github.com/bitcoin-gsr/gsr-tooling"
 readme = "README.md"
 
+[features]
+default = ["cli"]
+# The `gsr` command line; the library has no dependencies without it.
+cli = ["dep:clap"]
+
 [[bin]]
 name = "gsr"
 path = "src/main.rs"
+required-features = ["cli"]
+doc = false
+
+[[test]]
+name = "cli"
+required-features = ["cli"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }

@@ -3,8 +3,9 @@
 //! Terminals are instructions (byte strings); symbol `t + k` is rule (macro) `k`. Rules may only use earlier
 //! rules once ordered, which the declaration order chosen by [`evaluate`] guarantees.
 
+use crate::opcodes::{OP_CALLMACRO, OP_MACRO};
 use crate::order::choose_order;
-use crate::script::{compact_len, write_compact, Decoded, Token, OP_CALLMACRO, OP_MACRO};
+use crate::script::{compact_len, write_compact, Decoded, Token};
 
 pub type Sym = u32;
 
@@ -136,7 +137,7 @@ pub fn encode(terms: &[Vec<u8>], g: &Grammar) -> (Vec<u8>, usize) {
     let enc = |s: &[Sym], out: &mut Vec<u8>| {
         for &x in s {
             if g.is_rule(x) {
-                out.push(OP_CALLMACRO);
+                out.push(OP_CALLMACRO.to_u8());
                 write_compact(out, g.rule(x) as u64);
             } else {
                 out.extend_from_slice(&terms[x as usize]);
@@ -148,7 +149,7 @@ pub fn encode(terms: &[Vec<u8>], g: &Grammar) -> (Vec<u8>, usize) {
     for r in &g.rules {
         body.clear();
         enc(r, &mut body);
-        out.push(OP_MACRO);
+        out.push(OP_MACRO.to_u8());
         write_compact(&mut out, body.len() as u64);
         out.extend_from_slice(&body);
     }

@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use gsr_tooling::{info, lower_bounds, optimize, unroll, Bounds, Info};
+use gsr::{compress, info, lower_bounds, unroll, Bounds, Info, Report, Severity};
 
 fn hex(path: &Path) -> Vec<u8> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -20,11 +20,22 @@ fn data(name: &str) -> Vec<u8> {
 }
 
 fn check(input: &[u8], protect: usize, expected: &[u8]) {
-    let (out, stats) = optimize(input, protect).unwrap();
+    let (out, stats) = compress(input, protect).unwrap();
     assert!(out == expected, "output differs from the reference ({} vs {} bytes)", out.len(), expected.len());
     assert_eq!(unroll(&out).unwrap(), unroll(input).unwrap());
     assert_eq!((stats.input_bytes, stats.output_bytes), (input.len(), out.len()));
     assert_eq!(stats.decl_len, info(&out).unwrap().decl_len);
+    // compression changes the offsets of what gsr::check finds, not the findings, and leaves no macro lints
+    let findings = |r: &Report| {
+        let mut rules: Vec<&str> =
+            r.diagnostics.iter().filter(|d| d.severity() != Severity::Lint).map(|d| d.rule.id()).collect();
+        rules.dedup();
+        let stopped = r.stack_analysis_stopped.as_ref().map(|s| s.reason.clone());
+        (r.decoding, r.witness_items.clone(), rules, stopped)
+    };
+    let (before, after) = (gsr::check(input), gsr::check(&out));
+    assert_eq!(findings(&before), findings(&after));
+    assert_eq!(after.count(Severity::Lint), 0);
 }
 
 #[test]
@@ -57,11 +68,11 @@ fn info_and_bounds() {
 fn protected_prefix_stays_literal() {
     let input = data("sample.hex");
     let main = |s: &[u8]| s[info(s).unwrap().decl_len..].to_vec();
-    let (out, _) = optimize(&input, 40).unwrap();
+    let (out, _) = compress(&input, 40).unwrap();
     // the 32-byte push and the prologue instructions starting below 40 (sample.hex has one declaration of 6 bytes)
     let k = 33 + 3 + 1 + 2 + 1 + 3;
     assert_eq!(main(&out)[..k], main(&input)[..k]);
-    let (free, _) = optimize(&input, 0).unwrap();
+    let (free, _) = compress(&input, 0).unwrap();
     assert_ne!(main(&free)[..k], main(&input)[..k]);
 }
 

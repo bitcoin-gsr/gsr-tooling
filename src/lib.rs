@@ -1,6 +1,12 @@
-//! Macro compression for Tapleaf 0xC2 (GSR) scripts.
+//! Tools for Tapleaf 0xC2 (GSR) scripts.
 //!
-//! [`optimize`] shrinks a script by searching for a small reusable-macro grammar (`OP_MACRO` declarations,
+//! - [`opcodes`]: what each byte means as an instruction (names, classes, stack effects);
+//! - [`check`]: static checks for consensus errors, policy warnings and lints, without executing the script;
+//! - [`compress`], [`unroll`], [`info`], [`lower_bounds`]: macro compression and its measures.
+//!
+//! # Macro compression
+//!
+//! [`compress`] shrinks a script by searching for a small reusable-macro grammar (`OP_MACRO` declarations,
 //! `OP_CALLMACRO` references) that unrolls to exactly the same script. The committed size is minimized exactly:
 //! every declaration header, every CompactSize index (one byte below 253, three above) and every body is counted.
 //! The problem statement, the cost model and results are in `docs/macro-optimization.md`.
@@ -20,8 +26,10 @@
 //! macro) run in parallel and the smallest result is kept.
 
 mod bound;
+mod check;
 mod grammar;
 mod irr;
+pub mod opcodes;
 mod order;
 mod parse;
 mod script;
@@ -29,6 +37,7 @@ mod suffix;
 
 use std::fmt;
 
+pub use check::{check, Decoding, Diagnostic, Report, Rule, Severity};
 pub use grammar::Start;
 use grammar::{encode, evaluate, from_script, in_declaration_order, Grammar};
 use script::{decode, Token};
@@ -74,7 +83,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// What [`optimize`] found.
+/// What [`compress`] found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stats {
     pub input_bytes: usize,
@@ -122,7 +131,7 @@ fn search(mut g: Grammar, min_saving: i64) -> Grammar {
 /// Main-script bytes below `protect` stay literal at their offsets from the start of the main script, up to the
 /// first macro reference among them: for scripts that read their own bytes at fixed offsets. The result does not
 /// depend on the values of the protected instructions.
-pub fn optimize(script: &[u8], protect: usize) -> Result<(Vec<u8>, Stats), Error> {
+pub fn compress(script: &[u8], protect: usize) -> Result<(Vec<u8>, Stats), Error> {
     let d = decode(script)?;
     let results: Vec<(Vec<u8>, usize)> = std::thread::scope(|s| {
         let handles: Vec<_> = CONFIGS
@@ -177,7 +186,7 @@ pub struct Info {
     pub declarations: usize,
     /// Length of the declarations: the offset of the main script.
     pub decl_len: usize,
-    /// Length of the script the interpreter runs.
+    /// Length of the script the interpreter runs. This and the counts below saturate at `u64::MAX`.
     pub unrolled_bytes: u64,
     /// Instructions substituted from bodies when unrolling.
     pub substituted: u64,
@@ -190,27 +199,33 @@ pub struct Info {
 
 pub fn info(script: &[u8]) -> Result<Info, Error> {
     let d = decode(script)?;
-    // (instructions, references, bytes) of each body's full expansion; bodies only use earlier ones
+    // (instructions, references, bytes) of each body's full expansion; bodies only use earlier ones. The sums
+    // saturate: nested references can unroll to more than 2^64 bytes.
     let mut totals: Vec<(u64, u64, u64)> = Vec::with_capacity(d.bodies.len());
     for body in &d.bodies {
-        let t = body.iter().fold((0, 0, 0), |(n, r, b), &(t, _)| match t {
-            Token::Op(bytes) => (n + 1, r, b + bytes.len() as u64),
-            Token::Call(k) => (n + totals[k].0, r + 1 + totals[k].1, b + totals[k].2),
+        let t = body.iter().fold((0u64, 0u64, 0u64), |(n, r, b), &(t, _)| match t {
+            Token::Op(bytes) => (n.saturating_add(1), r, b.saturating_add(bytes.len() as u64)),
+            Token::Call(k) => (
+                n.saturating_add(totals[k].0),
+                r.saturating_add(1).saturating_add(totals[k].1),
+                b.saturating_add(totals[k].2),
+            ),
         });
         totals.push(t);
     }
-    let (mut s, mut r, mut l) = (0, 0, 0);
+    let (mut s, mut r, mut l) = (0u64, 0u64, 0u64);
     for &(t, _) in &d.main {
         match t {
-            Token::Op(bytes) => l += bytes.len() as u64,
+            Token::Op(bytes) => l = l.saturating_add(bytes.len() as u64),
             Token::Call(k) => {
-                s += totals[k].0;
-                r += 1 + totals[k].1;
-                l += totals[k].2;
+                s = s.saturating_add(totals[k].0);
+                r = r.saturating_add(1).saturating_add(totals[k].1);
+                l = l.saturating_add(totals[k].2);
             }
         }
     }
-    let write = if d.bodies.is_empty() { 0 } else { 800 + 7 * l.div_ceil(8) * 8 };
+    let write =
+        if d.bodies.is_empty() { 0 } else { 7u64.saturating_mul(l.div_ceil(8).saturating_mul(8)).saturating_add(800) };
     Ok(Info {
         bytes: script.len(),
         declarations: d.bodies.len(),
@@ -218,7 +233,7 @@ pub fn info(script: &[u8]) -> Result<Info, Error> {
         unrolled_bytes: l,
         substituted: s,
         references: r,
-        unrolling_charge: 300 * (s + r) + write,
+        unrolling_charge: s.saturating_add(r).saturating_mul(300).saturating_add(write),
     })
 }
 

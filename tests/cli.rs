@@ -49,3 +49,21 @@ fn rejects_bad_input() {
     let out = gsr(&["info"], b"d1 00"); // a reference without declarations
     assert!(String::from_utf8(out.stderr).unwrap().contains("undeclared macro"));
 }
+
+#[test]
+fn check_reports_and_exits() {
+    let out = gsr(&["check"], data("sample2.out.hex").as_bytes());
+    assert_eq!(out.status.code(), Some(1)); // a fragment: it leaves 600 items on the stack
+    assert!(String::from_utf8(out.stdout).unwrap().contains("error[stack-unsatisfiable]"));
+    let out = gsr(&["check", "--json"], b"0105 75 51"); // a non-minimal push
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    for field in
+        ["\"decoding\": \"well-formed\"", "\"warnings\": 1", "\"rule\": \"non-minimal-push\"", "\"witness_items\": [0]"]
+    {
+        assert!(text.contains(field), "{text}");
+    }
+    assert_eq!(gsr(&["check", "--deny", "warnings"], b"0105 75 51").status.code(), Some(1));
+    assert_eq!(gsr(&["check", "--deny", "lints"], b"d00193 d100").status.code(), Some(1)); // a single-use macro
+    assert_eq!(gsr(&["check", "--deny", "warnings"], b"d00193 d100").status.code(), Some(0));
+}
