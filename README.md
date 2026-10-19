@@ -13,6 +13,10 @@ implemented by [jmoik/bitcoin `gsr`](https://github.com/jmoik/bitcoin/tree/gsr) 
 - **Macro compression** (`gsr compress`): a small reusable-macro grammar (`OP_MACRO` declarations, `OP_CALLMACRO`
   references) that unrolls to exactly the same script, minimizing the exact committed size. The problem statement,
   cost model and results are in [docs/macro-optimization.md](docs/macro-optimization.md).
+- **Bottom-anchored addressing** (`gsr anchor`): rewrites deep reads `<d> OP_PICK|OP_ROLL` as
+  `OP_DEPTH <H-d> OP_SUB OP_PICK|OP_ROLL`, which repeat where the relative depths do not, so the script compresses
+  better (RISC Zero verifier: 91,550 → 77,321 bytes compressed). Only when the stack analysis proves that one
+  witness item count can succeed and fixes every rewritten read's height; it costs more varops.
 
 ## Command line
 
@@ -25,6 +29,7 @@ Scripts are hex, read from a file or stdin and written to a file or stdout.
 ```sh
 gsr check script.hex                    # exit code 1 on errors
 gsr check --json --deny warnings script.hex
+gsr anchor script.hex -o anchored.hex   # reads at least 320 deep (--min-depth), summary as JSON on stderr
 gsr compress script.hex -o out.hex      # summary as JSON on stderr
 gsr compress --protect 2949 script.hex  # keep the main script's first 2949 bytes literal at their offsets
 gsr unroll out.hex                      # the script it runs
@@ -45,11 +50,13 @@ use gsr::opcodes::Opcode;
 
 assert!(Opcode::from_u8(0x4f).is_op_success());          // OP_1NEGATE
 let report = gsr::check(&script);                         // diagnostics, witness item counts
-let (out, stats) = gsr::compress(&script, 0)?;            // unrolls to exactly `script`
+let (anchored, _) = gsr::anchor(&script, 320, 0)?;        // or why it cannot prove the rewrite
+let (out, stats) = gsr::compress(&anchored, 0)?;          // unrolls to exactly `anchored`
 let info = gsr::info(&out)?;                              // declarations, unrolled size, unrolling charge
 ```
 
-`compress` runs six search configurations in parallel; a 160 kB script takes 2–30 s.
+`compress` runs six search configurations in parallel; a 160 kB script takes 2–30 s, an anchored one about two
+minutes.
 
 ## Develop
 

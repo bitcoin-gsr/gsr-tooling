@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use gsr::{check, compress, info, lower_bounds, unroll, Report, Severity, Start};
+use gsr::{anchor, check, compress, info, lower_bounds, unroll, Report, Severity, Start};
 
 #[derive(Parser)]
 #[command(name = "gsr", version, about = "Tools for Tapleaf 0xC2 (GSR) scripts; scripts are hex")]
@@ -40,6 +40,26 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Keep the main script's first N bytes literal at their offsets
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        protect: usize,
+    },
+    /// Address deep stack reads from the bottom, so they repeat and compress
+    ///
+    /// Rewrites `<d> OP_PICK|OP_ROLL` in the main script, d at least --min-depth, to `OP_DEPTH <H-d> OP_SUB
+    /// OP_PICK|OP_ROLL`, where the stack height H is fixed by the only witness item count that can succeed. Refuses
+    /// when it cannot prove that. The proof covers the stack depths only: the rewritten script costs more varops,
+    /// holds a few more stack bytes, and changes what depends on the script's bytes or length (see docs). Writes the
+    /// script, and a JSON summary to stderr.
+    Anchor {
+        /// Input file (default: stdin)
+        input: Option<PathBuf>,
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Rewrite reads at least this deep
+        #[arg(long, value_name = "N", default_value_t = 320)]
+        min_depth: u64,
+        /// Leave the main script's first N bytes as they are
         #[arg(long, value_name = "N", default_value_t = 0)]
         protect: usize,
     },
@@ -215,6 +235,20 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     ("start", start.to_string()),
                     ("min_saving", st.min_saving.to_string()),
                     ("seconds", format!("{:.1}", t0.elapsed().as_secs_f64())),
+                ])
+            );
+        }
+        Command::Anchor { input, output, min_depth, protect } => {
+            let (out, st) = anchor(&read_script(&input)?, min_depth, protect)?;
+            write_script(&output, &out)?;
+            eprintln!(
+                "{}",
+                json(&[
+                    ("input_bytes", st.input_bytes.to_string()),
+                    ("output_bytes", st.output_bytes.to_string()),
+                    ("rewritten", st.rewritten.to_string()),
+                    ("kept", st.kept.to_string()),
+                    ("witness_items", st.witness_items.to_string()),
                 ])
             );
         }

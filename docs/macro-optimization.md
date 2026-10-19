@@ -4,10 +4,12 @@ Reusable macros (`OP_MACRO` 0xd0 declarations, `OP_CALLMACRO` 0xd1 references) l
 than the script it runs. This note states the choice of macros as an exact optimization problem, under the
 consensus rules of jmoik/bitcoin `gsr` @ `ad6c16f` (`src/script/reusable_macros.cpp`, `src/script/varops.h`,
 `src/script/interpreter.cpp`), and describes the optimizer of this crate (`gsr compress`), which solves it
-heuristically with bounds. [Results](#results) are for the verifier scripts of
-[gsr-stark-verifier](https://github.com/jmoik/gsr-stark-verifier), where it was first written in Python with a C++
-core (`macro_opt.py`); the greedy baseline `compress.py`, the Re-Pair comparison and the `.py` checks named below
-live there. This crate reproduces that implementation's output byte for byte (`tests/reference.rs`).
+heuristically with bounds, and `gsr anchor`, which rewrites deep stack reads so they compress. [Results](#results)
+are for the verifier scripts of [gsr-stark-verifier](https://github.com/jmoik/gsr-stark-verifier), where the
+optimizer was first written in Python with a C++ core (`macro_opt.py`). This crate reproduces that
+implementation's output byte for byte (`tests/reference.rs`). The verifier now calls `gsr compress` and
+`gsr check` at a pinned revision of this crate; its greedy `compress.py` and `check_compression.py` were removed,
+so the greedy columns and the comparison below are as measured before.
 
 ## Model
 
@@ -83,10 +85,11 @@ need padding, and past that point the objective trades bytes against charge at 1
 
 **Same behaviour.** The reusable-macros BIP guarantees that a well-formed `C` and its `unroll(C)` give the same
 result, final stack and opcode positions for any initial stack and transaction context, except for
-(1) anything that commits to the script bytes (the Tapleaf hash, signature messages, OP_TX fields such as
-`CURRENT_TAPSCRIPT`), (2) the weight-funded budget and (3) the unrolling charge. So `C` can replace `U` iff
+(1) anything that depends on the script bytes or their length (the Tapleaf hash, signature messages, OP_TX
+fields such as `CURRENT_TAPSCRIPT` and `TX_WEIGHT`), (2) the weight-funded budget and (3) the unrolling charge. So `C` can replace `U` iff
 constraints 1–2 hold, `U` reads nothing of kind (1) (or reads it in a way the generator compensates), and
-constraint 4 holds. `check_compression.py` checks all three. The rollup leaf is the compensated case: it reads its
+constraint 4 holds. `gsr compress` asserts constraint 2 and the protected prefix, `gsr check` checks constraints 1
+and 3, and constraint 4 needs the spend's varops (`gsr-meter`). The rollup leaf is the compensated case: it reads its
 own script with OP_TX to splice in the next root, so (a) the root push must stay literal at offset 0 of `M` (the
 script offset is then the declarations' length `d`), and (b) the prologue that embeds `d` must stay out of the
 declarations, so the declarations do not depend on `d` and the generator's fixed point `d → C(d) → d` converges.
@@ -139,8 +142,8 @@ of protected instructions, which the rollup's fixed point needs. About 15 s for 
 ## Results
 
 The compressed RISC Zero covenant spend falls from 331,097 WU (greedy `compress.py`) to **306,964 WU** (−24,133 WU,
-−7.3%): 9,796 WU from the optimizer and 14,337 WU from generating deep stack accesses bottom-anchored (addressed
-from the stack bottom as `DEPTH <i+1> SUB PICK`), which makes them repeat and compress.
+−7.3%): 9,796 WU from the optimizer and 14,337 WU from addressing deep stack reads from the stack bottom
+([below](#bottom-anchored-addressing)), which makes them repeat and compress.
 
 The optimizers compared on the same input, the scripts as generated before (relative addressing). Committed script
 bytes (`macro_benchmark.py`; every macro encoding unrolls to the same script, checked). Deflate
@@ -179,11 +182,45 @@ Re-Pair with the same pruning ends 2.2% above, local search gains 0.05%, the ind
 bound without the dependency constraint, and 58% of the RISC Zero result (53 KB) is main-script instructions left
 literal, mostly depth operands that occur in no repeat worth a declaration.
 
+## Bottom-anchored addressing
+
+A deep read `<d> PICK` names its value by its depth `d`, which changes whenever the stack above it grows or
+shrinks, so reads of the same value rarely repeat. Its index from the bottom, `H − d − 1` at stack height `H`, stays
+the same while the value stays put. `gsr anchor` rewrites each read `<d> PICK|ROLL` of the main script with
+`d ≥ 320` (`--min-depth`) as `DEPTH <H − d> SUB PICK|ROLL`, with `H − d` pushed minimally (a direct push for 0x81,
+as `OP_1NEGATE` is an OP_SUCCESSx). The script grows, and compresses much better:
+
+| Script | plain | anchored | compressed | anchored, compressed |
+|---|---:|---:|---:|---:|
+| RISC Zero, fixed statement | 160,600 | 177,544 | 91,550 | **77,321** |
+| RISC Zero covenant | 160,835 | 177,793 | 91,475 | **77,138** |
+| Rollup settlement leaf (`--protect 2702`) | 161,252 | 178,210 | 92,023 | **77,684** |
+
+`H` is the height at run time, so the rewrite needs it fixed in advance. `gsr check`'s stack analysis follows the
+depth relative to the witness on every path; `gsr anchor` rewrites a script only if every path that runs to the end
+ends at the same depth `δ` (so `1 − δ` witness items is the only count that can leave one item; the item-count
+requirements of the paths are ignored, since a rewritten read may succeed where the original failed), the analysis
+did not stop, there is no `OP_CODESEPARATOR` (it would move the positions signatures commit to), and the script
+checks without errors. It rewrites a read only where all paths reaching it agree on its height and the two extra
+items fit under the 32,768-item limit, and leaves the protected prefix (`--protect`) alone. With `1 − δ` witness
+items both scripts read the same values; with any other count both end with the wrong number of items. The
+rewritten script is checked again for the same witness count. The proof covers the stack depths only, so the
+caller must account for the rest: two instructions more per rewritten read (more execution varops: re-check the
+budget), up to 4 bytes more on the stack at a rewritten read (a spend within 4 bytes of the 8,000,000-byte total
+stack size can fail), anything that depends on the script's bytes or length (signatures, the Tapleaf hash, the
+taptree root and output key, `OP_TX`'s tapscript, witness items and transaction weight), and the point at which a
+failing witness fails.
+
+On the three verifier scripts `gsr anchor` rewrites every read the generator anchored (8,472–8,479) and gives its
+anchored scripts byte for byte.
+
 ## Reproduce
 
-The benchmark and the behaviour checks are gsr-stark-verifier's `macro_benchmark.py` and `check_compression.py`.
+The comparison of optimizers used gsr-stark-verifier's `macro_benchmark.py`.
 
 ```sh
-gsr compress script.hex -o out.hex
-gsr info --bounds script.hex          # unrolling charge, distinct-instruction and LZ lower bounds
+gsr anchor script.hex -o anchored.hex
+gsr compress anchored.hex -o out.hex
+gsr check out.hex                     # witness item count, errors
+gsr info --bounds out.hex             # unrolling charge, distinct-instruction and LZ lower bounds
 ```

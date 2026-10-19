@@ -7,11 +7,12 @@
 //!
 //! The stack analysis follows every path through the conditionals with the stack depths relative to the witness
 //! (no values): it finds the witness item counts that end with exactly one item, and paths that cannot get past an
-//! instruction. It stops at instructions whose stack effect depends on values it does not track (`OP_PICK` and
-//! `OP_ROLL` without a literal depth, `OP_TX`). Branch conditions are not tracked either, so a path may combine
-//! branches that no witness takes together; errors are only reported when no path at all gets through.
+//! instruction. `OP_PICK` and `OP_ROLL` keep the depth or lower it by one whatever their operand, and `OP_TX`
+//! changes it by what the literal selector pushed right before it selects; the analysis stops at an `OP_TX` without
+//! one, and when more than 256 depths are possible at one point. Branch conditions are not tracked, so a path may
+//! combine branches that no witness takes together; errors are only reported when no path at all gets through.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::opcodes::{Class, Opcode};
@@ -174,18 +175,34 @@ impl Report {
 
 /// Checks a script without executing it.
 pub fn check(script: &[u8]) -> Report {
+    analyze(script).0
+}
+
+/// What the stack analysis found beyond the report, for rewrites that depend on the stack height.
+pub(crate) struct Analysis {
+    /// The depth relative to the witness at the end of each path, when the analysis ran to the end.
+    pub final_deltas: Vec<i64>,
+    /// For each push in the main script, by offset: the depth relative to the witness before it and the deepest
+    /// altstack, if every path reaching it has that depth.
+    pub heights: HashMap<usize, Option<(i64, i64)>>,
+    /// Whether the unrolled script has an `OP_CODESEPARATOR`.
+    pub codeseparator: bool,
+}
+
+pub(crate) fn analyze(script: &[u8]) -> (Report, Analysis) {
     let mut report = Report {
         decoding: Decoding::WellFormed,
         diagnostics: Vec::new(),
         witness_items: None,
         stack_analysis_stopped: None,
     };
-    run(script, &mut report);
+    let mut analysis = Analysis { final_deltas: Vec::new(), heights: HashMap::new(), codeseparator: false };
+    run(script, &mut report, &mut analysis);
     report.diagnostics.sort_by_key(|d| (d.severity(), d.offset));
-    report
+    (report, analysis)
 }
 
-fn run(script: &[u8], report: &mut Report) {
+fn run(script: &[u8], report: &mut Report, analysis: &mut Analysis) {
     let (d, failure) = decode_prefix(script);
     // Everything decode_prefix returns precedes the failure, in serialized order: bodies, then the main script.
     let sequences = d.bodies.iter().enumerate().map(|(k, b)| (b, d.declarations[k].body, Some(k)));
@@ -254,7 +271,7 @@ fn run(script: &[u8], report: &mut Report) {
             Token::Op(bytes) => walk.step(bytes, Loc { offset: base + p, declaration }),
         }
     }
-    walk.finish(script.len(), report);
+    walk.finish(script.len(), report, analysis);
 }
 
 /// Unused and single-use declarations.
@@ -310,7 +327,27 @@ struct Frame {
     waiting: Vec<State>,
 }
 
-struct Walk {
+/// What a push left on the stack, for the instruction after it.
+#[derive(Clone, Copy)]
+enum Literal<'a> {
+    Bytes(&'a [u8]),
+    Num(u8),
+}
+
+impl Literal<'_> {
+    /// Its value as a number (unsigned little-endian), if it fits 64 bits.
+    fn number(self) -> Option<u64> {
+        match self {
+            Literal::Num(n) => Some(n.into()),
+            Literal::Bytes(b) if b.iter().skip(8).all(|&x| x == 0) => {
+                Some(b.iter().take(8).rev().fold(0, |n, &x| n << 8 | x as u64))
+            }
+            Literal::Bytes(_) => None,
+        }
+    }
+}
+
+struct Walk<'a> {
     diagnostics: Vec<Diagnostic>,
     seen: HashSet<(Rule, usize)>,
     /// Open `OP_IF`/`OP_NOTIF`s, for balance.
@@ -318,11 +355,13 @@ struct Walk {
     /// The conditionals the stack analysis is inside, outermost first; empty once it stopped.
     frames: Vec<Frame>,
     stopped: Option<Stop>,
-    /// The number the previous instruction pushed, if it was a push of at most 8 bytes.
-    literal: Option<u64>,
+    /// What the previous instruction pushed, if it was a push.
+    literal: Option<Literal<'a>>,
+    heights: HashMap<usize, Option<(i64, i64)>>,
+    codeseparator: bool,
 }
 
-impl Walk {
+impl<'a> Walk<'a> {
     fn new() -> Self {
         let start = State { delta: 0, alt: 0, need: 0, need_at: Loc { offset: 0, declaration: None } };
         Walk {
@@ -332,6 +371,8 @@ impl Walk {
             frames: vec![Frame { active: vec![start], waiting: Vec::new() }],
             stopped: None,
             literal: None,
+            heights: HashMap::new(),
+            codeseparator: false,
         }
     }
 
@@ -358,10 +399,15 @@ impl Walk {
         self.stopped.is_some() || self.frames.iter().any(|f| !f.active.is_empty() || !f.waiting.is_empty())
     }
 
-    fn step(&mut self, bytes: &[u8], at: Loc) {
+    fn step(&mut self, bytes: &'a [u8], at: Loc) {
         let op = Opcode::from_u8(bytes[0]);
         let literal = self.literal.take();
-        match op.class() {
+        let class = op.class();
+        if at.declaration.is_none() && matches!(class, Class::PushBytes(_) | Class::PushData(_) | Class::PushNum(_)) {
+            self.record_height(at);
+        }
+        self.codeseparator |= op.to_u8() == 0xab;
+        match class {
             Class::PushBytes(_) | Class::PushData(_) => {
                 let data = &bytes[bytes.len() - push_len(bytes)..];
                 if let Some(expected) = non_minimal(bytes[0], data) {
@@ -370,13 +416,11 @@ impl Walk {
                     });
                 }
                 self.apply(at, 0, 1, 0, 0);
-                if data.len() <= 8 {
-                    self.literal = Some(data.iter().rev().fold(0, |n, &b| n << 8 | b as u64));
-                }
+                self.literal = Some(Literal::Bytes(data));
             }
             Class::PushNum(n) => {
                 self.apply(at, 0, 1, 0, 0);
-                self.literal = Some(n as u64);
+                self.literal = Some(Literal::Num(n));
             }
             Class::UpgradableNop => {
                 self.report(Rule::UpgradableNop, at, || {
@@ -414,13 +458,23 @@ impl Walk {
             Class::Operation => match op.stack_effect() {
                 Some(e) => self.apply(at, e.pop.into(), e.push.into(), e.alt_pop.into(), e.alt_push.into()),
                 None => match (op.to_u8(), literal) {
-                    // OP_PICK and OP_ROLL with a literal depth n: n + 1 items below n, then n + 1 (OP_ROLL) or n + 2
-                    (0x79 | 0x7a, Some(n)) if n < MAX_STACK_SIZE as u64 => {
-                        let n = n as i64;
-                        self.apply(at, n + 2, if op.to_u8() == 0x79 { n + 2 } else { n + 1 }, 0, 0);
+                    // OP_PICK and OP_ROLL with depth n need n + 2 items (n included) and leave as many (OP_PICK) or
+                    // one fewer (OP_ROLL); with n computed at run time, at least 2
+                    (0x79 | 0x7a, literal) => {
+                        let need =
+                            literal.and_then(Literal::number).map_or(2, |n| n.min(MAX_STACK_SIZE as u64) as i64 + 2);
+                        self.apply(at, need, need - i64::from(op.to_u8() == 0x7a), 0, 0);
                     }
-                    (0x79 | 0x7a, Some(n)) => self.stop(at, format!("{op} with depth {n}, beyond the stack limit")),
-                    (0x79 | 0x7a, None) => self.stop(at, format!("{op} with a depth computed at run time")),
+                    (0xbf, literal) => {
+                        let selector = match literal {
+                            Some(Literal::Bytes(b)) => b,
+                            _ => &[],
+                        };
+                        match op_tx_effect(selector) {
+                            Ok((pop, push)) => self.apply(at, pop, push, 0, 0),
+                            Err(reason) => self.stop(at, reason.into()),
+                        }
+                    }
                     // OP_IFDUP: (x -- x) if x is zero, else (x -- x x)
                     (0x73, _) => {
                         if let Some(f) = self.frames.last_mut() {
@@ -435,7 +489,7 @@ impl Walk {
                         }
                         self.check_paths(at);
                     }
-                    _ => self.stop(at, format!("{op}'s stack effect depends on its operands")),
+                    _ => unreachable!("{op} has a stack effect"),
                 },
             },
         }
@@ -496,19 +550,32 @@ impl Walk {
         self.check_paths(at);
     }
 
+    /// Records the depth before a main-script push, if every path executing it agrees on it.
+    fn record_height(&mut self, at: Loc) {
+        let height = self.frames.last().and_then(|f| {
+            let first = f.active.first()?;
+            f.active
+                .iter()
+                .all(|s| s.delta == first.delta)
+                .then(|| (first.delta, f.active.iter().map(|s| s.alt).max().unwrap()))
+        });
+        self.heights.insert(at.offset, height);
+    }
+
     fn check_paths(&mut self, at: Loc) {
         if self.frames.last().is_some_and(|f| f.active.len() > MAX_PATHS) {
             self.stop(at, format!("more than {MAX_PATHS} distinct stack depths"));
         }
     }
 
-    fn finish(mut self, end: usize, report: &mut Report) {
+    fn finish(mut self, end: usize, report: &mut Report, analysis: &mut Analysis) {
         for at in std::mem::take(&mut self.open) {
             self.report(Rule::UnbalancedConditional, at, || "OP_IF or OP_NOTIF without OP_ENDIF".into());
             self.stop(at, "unbalanced conditional".into());
         }
         if self.stopped.is_none() {
             let states = &self.frames[0].active;
+            analysis.final_deltas = states.iter().map(|s| s.delta).collect();
             let mut items: Vec<u64> = states
                 .iter()
                 .filter(|s| {
@@ -546,7 +613,59 @@ impl Walk {
         }
         report.diagnostics.extend(self.diagnostics);
         report.stack_analysis_stopped = self.stopped;
+        analysis.heights = self.heights;
+        analysis.codeseparator = self.codeseparator;
     }
+}
+
+/// The stack effect of `OP_TX` with `selector` pushed right before it (`op_tx::Eval`) -> (pop, push): it pops the
+/// selector and the scope operands (one for SINGLE, two for RANGE), and pushes one item if it collates, else one per
+/// selected value. Otherwise why the effect is not fixed.
+fn op_tx_effect(selector: &[u8]) -> Result<(i64, i64), &'static str> {
+    const COLLATE: u8 = 0x01;
+    const INPUT_WITNESS_ITEMS: u8 = 0x80;
+    let &[version, globals, context, scopes, input_fields, output_fields] = selector else {
+        return Err("OP_TX without a 6-byte selector pushed right before it");
+    };
+    if version != 0 {
+        return Err("OP_TX with a reserved selector version succeeds immediately");
+    }
+    let (inputs, outputs) = (scopes >> 4, scopes & 0x0f);
+    let valid = inputs <= 4
+        && outputs <= 4
+        && output_fields & !0x03 == 0
+        && (inputs == 0) == (input_fields == 0)
+        && (outputs == 0) == (output_fields == 0)
+        && (globals & !COLLATE != 0 || context != 0 || input_fields != 0 || output_fields != 0);
+    if !valid {
+        return Err("OP_TX with an invalid selector fails");
+    }
+    let operands = |scope: u8| match scope {
+        3 => 1, // SINGLE
+        4 => 2, // RANGE
+        _ => 0,
+    };
+    let pop = 1 + operands(inputs) + operands(outputs);
+    if globals & COLLATE != 0 {
+        return Ok((pop, 1));
+    }
+    if input_fields & INPUT_WITNESS_ITEMS != 0 {
+        return Err("OP_TX pushes one item per witness item of the selected inputs");
+    }
+    // values per scope: NONE none, CURRENT and SINGLE one; ALL and RANGE depend on the transaction
+    let count = |scope: u8| match scope {
+        0 => Some(0),
+        1 | 3 => Some(1),
+        _ => None,
+    };
+    let (Some(n_in), Some(n_out)) = (count(inputs), count(outputs)) else {
+        return Err("OP_TX pushes one item per selected input or output");
+    };
+    let values = (globals & !COLLATE).count_ones()
+        + context.count_ones()
+        + n_in * input_fields.count_ones()
+        + n_out * output_fields.count_ones();
+    Ok((pop, values.into()))
 }
 
 fn raise_need(s: &mut State, pop: i64, at: Loc) {

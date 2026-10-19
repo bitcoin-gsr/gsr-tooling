@@ -2,7 +2,8 @@
 //!
 //! - [`opcodes`]: what each byte means as an instruction (names, classes, stack effects);
 //! - [`check`]: static checks for consensus errors, policy warnings and lints, without executing the script;
-//! - [`compress`], [`unroll`], [`info`], [`lower_bounds`]: macro compression and its measures.
+//! - [`compress`], [`unroll`], [`info`], [`lower_bounds`]: macro compression and its measures;
+//! - [`anchor`]: bottom-anchored stack addressing, a rewrite that makes deep reads repeat so they compress.
 //!
 //! # Macro compression
 //!
@@ -25,6 +26,7 @@
 //! from the script's own macros or from the unrolled script, with a minimum saving of 0, 1 or 2 bytes per new
 //! macro) run in parallel and the smallest result is kept.
 
+mod anchor;
 mod bound;
 mod check;
 mod grammar;
@@ -37,6 +39,7 @@ mod suffix;
 
 use std::fmt;
 
+pub use anchor::{anchor, Anchored};
 pub use check::{check, Decoding, Diagnostic, Report, Rule, Severity};
 pub use grammar::Start;
 use grammar::{encode, evaluate, from_script, in_declaration_order, Grammar};

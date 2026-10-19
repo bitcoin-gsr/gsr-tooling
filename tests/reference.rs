@@ -1,13 +1,15 @@
 //! Byte-exact agreement with the reference outputs (the earlier Python/C++ implementation).
 //!
 //! `tests/data` holds small scripts. Larger ones run with `GSR_REFERENCE_DIR` set to a directory of `<name>.hex`
-//! inputs, `<name>.out.hex` expected outputs and optional `<name>.protect` (a byte count):
+//! inputs, `<name>.out.hex` expected outputs and optional `<name>.protect` (a byte count). There `gsr::anchor`
+//! (with the minimum depth 320) must turn each `<name>.relative.hex`, protecting `<name>.relative.protect` bytes,
+//! into `<name>.anchored.hex`:
 //!
 //!     GSR_REFERENCE_DIR=path cargo test --release -- --ignored
 
 use std::path::Path;
 
-use gsr::{compress, info, lower_bounds, unroll, Bounds, Info, Report, Severity};
+use gsr::{anchor, compress, info, lower_bounds, unroll, Bounds, Info, Report, Severity};
 
 fn hex(path: &Path) -> Vec<u8> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -17,6 +19,10 @@ fn hex(path: &Path) -> Vec<u8> {
 
 fn data(name: &str) -> Vec<u8> {
     hex(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name))
+}
+
+fn protect(dir: &Path, stem: &str) -> usize {
+    std::fs::read_to_string(dir.join(format!("{stem}.protect"))).map(|s| s.trim().parse().unwrap()).unwrap_or(0)
 }
 
 fn check(input: &[u8], protect: usize, expected: &[u8]) {
@@ -86,12 +92,29 @@ fn matches_reference_scripts() {
         let name = path.file_name().unwrap().to_str().unwrap();
         let Some(stem) = name.strip_suffix(".out.hex") else { continue };
         let input = Path::new(&dir).join(format!("{stem}.hex"));
-        let protect = std::fs::read_to_string(Path::new(&dir).join(format!("{stem}.protect")))
-            .map(|s| s.trim().parse().unwrap())
-            .unwrap_or(0);
-        check(&hex(&input), protect, &hex(&path));
+        check(&hex(&input), protect(Path::new(&dir), stem), &hex(&path));
         eprintln!("{stem}: identical");
         n += 1;
     }
     assert!(n > 0, "no <name>.out.hex in {dir}");
+}
+
+#[test]
+#[ignore]
+fn matches_anchored_scripts() {
+    let dir = std::env::var("GSR_REFERENCE_DIR").expect("set GSR_REFERENCE_DIR");
+    let dir = Path::new(&dir);
+    let mut n = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let Some(stem) = name.strip_suffix(".relative.hex") else { continue };
+        let (out, stats) = anchor(&hex(&path), 320, protect(dir, &format!("{stem}.relative"))).unwrap();
+        let expected = hex(&dir.join(format!("{stem}.anchored.hex")));
+        assert!(out == expected, "{stem}: differs from the reference ({} vs {} bytes)", out.len(), expected.len());
+        assert_eq!(gsr::check(&out).witness_items, Some(vec![stats.witness_items]));
+        eprintln!("{stem}: anchored identically ({} reads)", stats.rewritten);
+        n += 1;
+    }
+    assert!(n > 0, "no <name>.relative.hex in {}", dir.display());
 }

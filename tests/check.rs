@@ -100,9 +100,32 @@ fn stacks() {
     assert_eq!(rules(&check(&hex("52 79"))), vec![("stack-unsatisfiable", 1, None)]);
     // OP_IFDUP OP_DROP: a nonzero item alone, or a zero on top of another
     assert_eq!(check(&hex("73 75")).witness_items, Some(vec![1, 2]));
-    // OP_DEPTH OP_PICK: the depth is not known
-    let r = check(&hex("74 79"));
-    assert_eq!((r.witness_items, r.stack_analysis_stopped.map(|s| s.offset)), (None, Some(1)));
+    // OP_PICK and OP_ROLL with a computed depth keep the depth, or lower it by one
+    assert_eq!(check(&hex("74 8c 79 77 77")).witness_items, Some(vec![2])); // DEPTH 1SUB PICK NIP NIP
+    assert_eq!(check(&hex("74 8c 7a 77")).witness_items, Some(vec![2])); // DEPTH 1SUB ROLL NIP
+                                                                         // OP_DEPTH OP_PICK needs two items, but would leave two from an empty witness
+    assert_eq!(rules(&check(&hex("74 79"))), vec![("stack-unsatisfiable", 1, None)]);
+}
+
+#[test]
+fn op_tx() {
+    // the annex (one item), the leaf hash, internal key and root (three), collated inputs (one)
+    assert_eq!(check(&hex("06 000002000000 bf")).witness_items, Some(vec![0]));
+    assert_eq!(check(&hex("06 000068000000 bf 6d")).witness_items, Some(vec![0]));
+    assert_eq!(check(&hex("06 000700203f00 bf")).witness_items, Some(vec![0]));
+    // two fields of the current input and of the output at an index (from the witness): four values
+    assert_eq!(check(&hex("06 000000130303 bf 6d 75")).witness_items, Some(vec![1]));
+    let stopped = |s: &str| check(&hex(s)).stack_analysis_stopped.map(|s| (s.offset, s.reason));
+    // no literal selector; a reserved version (succeeds); all outputs without collating
+    let reasons = [
+        ("74 bf", 1, "6-byte selector"),
+        ("06 010000000000 bf", 7, "succeeds"),
+        ("06 000000020003 bf", 7, "per selected"),
+    ];
+    for (script, offset, reason) in reasons {
+        let (at, why) = stopped(script).unwrap();
+        assert!(at == offset && why.contains(reason), "{script}: {at} {why}");
+    }
 }
 
 #[test]

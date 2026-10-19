@@ -67,3 +67,14 @@ fn check_reports_and_exits() {
     assert_eq!(gsr(&["check", "--deny", "lints"], b"d00193 d100").status.code(), Some(1)); // a single-use macro
     assert_eq!(gsr(&["check", "--deny", "warnings"], b"d00193 d100").status.code(), Some(0));
 }
+
+#[test]
+fn anchor_rewrites_or_refuses() {
+    let out = gsr(&["anchor", "--min-depth", "2"], b"52 79 77 77 77");
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "74519479777777");
+    assert!(String::from_utf8(out.stderr).unwrap().contains("\"witness_items\": 3"));
+    let out = gsr(&["anchor"], b"63 75 67 6d 68 51"); // two or three witness items
+    assert!(!out.status.success());
+    assert!(String::from_utf8(out.stderr).unwrap().contains("different stack depths"));
+}
