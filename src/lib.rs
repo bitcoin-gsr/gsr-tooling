@@ -3,7 +3,9 @@
 //! - [`opcodes`]: what each byte means as an instruction (names, classes, stack effects);
 //! - [`check`]: static checks for consensus errors, policy warnings and lints, without executing the script;
 //! - [`compress`], [`unroll`], [`info`], [`lower_bounds`]: macro compression and its measures;
-//! - [`anchor`]: bottom-anchored stack addressing, a rewrite that makes deep reads repeat so they compress.
+//! - [`anchor`]: bottom-anchored stack addressing, a rewrite that makes deep reads repeat so they compress;
+//! - [`disasm`]: a readable listing; [`attribute`]: a compressed script's bytes by labelled part of its source;
+//!   [`near_duplicates`]: sequences that would compress if a pushed number agreed.
 //!
 //! # Macro compression
 //!
@@ -27,10 +29,13 @@
 //! macro) run in parallel and the smallest result is kept.
 
 mod anchor;
+mod attribute;
 mod bound;
 mod check;
+mod disasm;
 mod grammar;
 mod irr;
+mod near;
 pub mod opcodes;
 mod order;
 mod parse;
@@ -39,10 +44,13 @@ mod suffix;
 
 use std::fmt;
 
-pub use anchor::{anchor, Anchored};
+pub use anchor::{anchor, anchor_auto, Anchored, Tried, CANDIDATE_MIN_DEPTHS};
+pub use attribute::{attribute, Attribution, LabelBytes, LabelledRange};
 pub use check::{check, Decoding, Diagnostic, Report, Rule, Severity};
+pub use disasm::{disasm, instruction_text};
 pub use grammar::Start;
 use grammar::{encode, evaluate, from_script, in_declaration_order, Grammar};
+pub use near::{near_duplicates, NearDuplicate, Varying};
 use script::{decode, Token};
 
 /// A script that is not well formed.

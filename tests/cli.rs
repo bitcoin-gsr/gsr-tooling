@@ -78,3 +78,45 @@ fn anchor_rewrites_or_refuses() {
     assert!(!out.status.success());
     assert!(String::from_utf8(out.stderr).unwrap().contains("different stack depths"));
 }
+
+#[test]
+fn anchor_chooses_the_threshold() {
+    let out = gsr(&["anchor"], b"52 79 77 77 77"); // no read 192 deep: not anchoring is smallest
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "5279777777");
+    let summary = String::from_utf8(out.stderr).unwrap();
+    for field in ["\"min_depth\": null", "\"compressed_bytes\": 5", "\"tried\": {\"none\": 5, \"512\": 5"] {
+        assert!(summary.contains(field), "{summary}");
+    }
+    let out = gsr(&["anchor", "--min-depth", "2"], b"52 79 77 77 77");
+    assert!(String::from_utf8(out.stderr).unwrap().contains("\"min_depth\": 2"));
+    assert!(!gsr(&["anchor", "--min-depth", "deep"], b"51").status.success());
+}
+
+#[test]
+fn analysis_commands() {
+    let out = gsr(&["disasm"], b"d00151 d100 0105");
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "; 7 bytes = declarations (1, 3 bytes) + main script (4 bytes)\nmacro0 @0 (1 bytes)\n       2  1\nmain @3\n       3  call0\n       5  0x05\n"
+    );
+    let dir = std::env::temp_dir().join(format!("gsr-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (plain, labels) = (dir.join("plain.hex"), dir.join("labels.txt"));
+    std::fs::write(&plain, "5279777777").unwrap();
+    std::fs::write(&labels, "# start end label\n0 2 the read\n2 5 nips\n").unwrap();
+    let args = ["attribute", "--plain", plain.to_str().unwrap(), "--labels", labels.to_str().unwrap()];
+    let out = gsr(&args, b"d003745194 d100 79777777");
+    let text = String::from_utf8(out.stdout).unwrap();
+    for field in ["\"bytes\": 11", "\"label\": \"the read\"", "\"main_bytes\": 3.0, \"declaration_bytes\": 5.0"] {
+        assert!(text.contains(field), "{text}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    let x = |n: u8| format!("01{n:02x} 79 939393939393");
+    let script = format!("{} 76 {} 7c {} 7d {} 82", x(20), x(21), x(22), x(23));
+    let out = gsr(&["near-duplicates", "--json"], script.as_bytes());
+    let text = String::from_utf8(out.stdout).unwrap();
+    for field in ["\"saving\": 6", "\"count\": 4", "\"step\": 1", "\"occurrences\": [0, 10, 20, 30]"] {
+        assert!(text.contains(field), "{text}");
+    }
+}

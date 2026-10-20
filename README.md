@@ -16,7 +16,11 @@ implemented by [jmoik/bitcoin `gsr`](https://github.com/jmoik/bitcoin/tree/gsr) 
 - **Bottom-anchored addressing** (`gsr anchor`): rewrites deep reads `<d> OP_PICK|OP_ROLL` as
   `OP_DEPTH <H-d> OP_SUB OP_PICK|OP_ROLL`, which repeat where the relative depths do not, so the script compresses
   better (RISC Zero verifier: 91,550 → 77,321 bytes compressed). Only when the stack analysis proves that one
-  witness item count can succeed and fixes every rewritten read's height; it costs more varops.
+  witness item count can succeed and fixes every rewritten read's height; it costs more varops. By default it
+  chooses how deep a read must be by compressing with each candidate threshold.
+- **Analysis**: `gsr disasm` lists a script readably; `gsr attribute` splits a compressed script's bytes over
+  labelled parts of the plain script it was made from; `gsr near-duplicates` finds sequences that repeat except
+  for a pushed number or two (a depth, an offset), which would compress if the numbers agreed.
 
 ## Command line
 
@@ -29,11 +33,14 @@ Scripts are hex, read from a file or stdin and written to a file or stdout.
 ```sh
 gsr check script.hex                    # exit code 1 on errors
 gsr check --json --deny warnings script.hex
-gsr anchor script.hex -o anchored.hex   # reads at least 320 deep (--min-depth), summary as JSON on stderr
+gsr anchor script.hex -o anchored.hex   # the threshold that compresses best (or --min-depth N); JSON on stderr
 gsr compress script.hex -o out.hex      # summary as JSON on stderr
 gsr compress --protect 2949 script.hex  # keep the main script's first 2949 bytes literal at their offsets
 gsr unroll out.hex                      # the script it runs
 gsr info --bounds out.hex               # sizes, unrolling charge and lower bounds as JSON
+gsr disasm out.hex                      # one instruction per line with its offset; references as call<k>
+gsr attribute out.hex --plain script.hex --labels ranges.txt   # bytes per label (lines `start end label`), JSON
+gsr near-duplicates anchored.hex        # repeats that differ in a pushed number, by estimated saving
 ```
 
 ## Library
@@ -50,13 +57,13 @@ use gsr::opcodes::Opcode;
 
 assert!(Opcode::from_u8(0x4f).is_op_success());          // OP_1NEGATE
 let report = gsr::check(&script);                         // diagnostics, witness item counts
-let (anchored, _) = gsr::anchor(&script, 320, 0)?;        // or why it cannot prove the rewrite
+let (anchored, _) = gsr::anchor(&script, 256, 0)?;        // or why it cannot prove the rewrite; anchor_auto
 let (out, stats) = gsr::compress(&anchored, 0)?;          // unrolls to exactly `anchored`
 let info = gsr::info(&out)?;                              // declarations, unrolled size, unrolling charge
 ```
 
-`compress` runs six search configurations in parallel; a 160 kB script takes 2–30 s, an anchored one about two
-minutes.
+`compress` runs six search configurations in parallel; a 160 kB script takes 2–30 s, an anchored one up to two
+minutes. `anchor_auto` compresses with each candidate threshold, a few at a time.
 
 ## Develop
 

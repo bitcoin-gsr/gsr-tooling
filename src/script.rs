@@ -54,6 +54,37 @@ fn read_compact(code: &[u8], i: usize) -> Result<(u64, usize), Error> {
     Ok((n, i + 1 + width))
 }
 
+/// The data a push instruction pushes (empty for `OP_0`), or `None` for other instructions and `OP_1`–`OP_16`.
+pub fn push_data(instruction: &[u8]) -> Option<&[u8]> {
+    match Opcode::from_u8(instruction[0]).class() {
+        Class::PushBytes(n) => Some(&instruction[instruction.len() - n as usize..]),
+        Class::PushData(width) => Some(&instruction[1 + width as usize..]),
+        _ => None,
+    }
+}
+
+/// The number a push instruction pushes (unsigned little-endian), if it fits 64 bits.
+pub fn number(instruction: &[u8]) -> Option<u64> {
+    if let Class::PushNum(n) = Opcode::from_u8(instruction[0]).class() {
+        return Some(n.into());
+    }
+    let data = push_data(instruction)?;
+    data.iter().skip(8).all(|&b| b == 0).then(|| data.iter().take(8).rev().fold(0, |n, &b| n << 8 | b as u64))
+}
+
+/// The minimal push of `n`: `OP_0`–`OP_16`, else its little-endian bytes without trailing zeros. The single byte
+/// 0x81 takes a direct push, as `OP_1NEGATE` is an OP_SUCCESSx in Tapleaf 0xC2.
+pub fn minimal_push(n: u64) -> Vec<u8> {
+    match n {
+        0 => vec![0x00],
+        1..=16 => vec![0x50 + n as u8],
+        _ => {
+            let len = 8 - n.leading_zeros() as usize / 8;
+            [&[len as u8][..], &n.to_le_bytes()[..len]].concat()
+        }
+    }
+}
+
 /// An instruction: an opcode with its push data, or a reference to a declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Token<'a> {

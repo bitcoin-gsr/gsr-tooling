@@ -12,7 +12,8 @@ fn rewrites_deep_reads() {
     // three witness items: OP_2 OP_PICK reads the bottom one, at index 1 from the bottom with OP_2 pushed
     let (out, st) = anchor(&hex("52 79 77 77 77"), 2, 0).unwrap();
     assert_eq!(out, hex("74 51 94 79 77 77 77"));
-    let expected = Anchored { input_bytes: 5, output_bytes: 7, rewritten: 1, kept: 0, witness_items: 3 };
+    let expected =
+        Anchored { input_bytes: 5, output_bytes: 7, min_depth: Some(2), rewritten: 1, kept: 0, witness_items: 3 };
     assert_eq!(st, expected);
     let (out, _) = anchor(&hex("52 7a 77 77"), 2, 0).unwrap();
     assert_eq!(out, hex("74 51 94 7a 77 77"));

@@ -21,8 +21,7 @@
 //! - which instruction a failing witness fails at.
 
 use crate::check::{analyze, Analysis};
-use crate::opcodes::{Class, Opcode};
-use crate::script::{decode, Token};
+use crate::script::{decode, minimal_push, number, Token};
 use crate::{Decoding, Severity};
 
 /// The most items the stack and altstack may hold together.
@@ -35,6 +34,8 @@ const OP_SUB: u8 = 0x94;
 pub struct Anchored {
     pub input_bytes: usize,
     pub output_bytes: usize,
+    /// How deep a read must be to be rewritten; `None` if [`anchor_auto`] found not anchoring smallest.
+    pub min_depth: Option<u64>,
     /// Reads at least `min_depth` deep that were rewritten.
     pub rewritten: usize,
     /// Reads at least `min_depth` deep left as they were: in the protected prefix, or where the height is not one
@@ -87,8 +88,70 @@ pub fn anchor(script: &[u8], min_depth: u64, protect: usize) -> Result<(Vec<u8>,
     if after != witness_items {
         return Err(format!("the rewritten script takes {after} witness items, not {witness_items}"));
     }
-    let stats = Anchored { input_bytes: script.len(), output_bytes: out.len(), rewritten, kept, witness_items };
+    let stats = Anchored {
+        input_bytes: script.len(),
+        output_bytes: out.len(),
+        min_depth: Some(min_depth),
+        rewritten,
+        kept,
+        witness_items,
+    };
     Ok((out, stats))
+}
+
+/// The thresholds [`anchor_auto`] tries, besides not anchoring. Reads less than 256 deep take a one-byte depth, so
+/// anchoring them rarely pays; on the verifier scripts the best threshold has been 256 or 320.
+pub const CANDIDATE_MIN_DEPTHS: [u64; 7] = [192, 224, 256, 288, 320, 384, 512];
+
+/// Each threshold [`anchor_auto`] tried (`None`: not anchoring) with the compressed size it gave.
+pub type Tried = Vec<(Option<u64>, usize)>;
+
+/// [`anchor`] with the threshold, from [`CANDIDATE_MIN_DEPTHS`] or none at all, whose result
+/// [`compress`](crate::compress) (with the same `protect`) makes smallest; on a tie, the one that rewrites the
+/// fewest reads. Also returns what it tried. Compresses up
+/// to one candidate per three cores at a time, so it takes a few times as long as compressing once.
+pub fn anchor_auto(script: &[u8], protect: usize) -> Result<(Vec<u8>, Anchored, Tried), String> {
+    // in order of preference on a tie: fewer rewrites first
+    let mut candidates: Vec<(Option<u64>, Vec<u8>, Anchored)> = Vec::new();
+    let (_, mut plain) = anchor(script, u64::MAX, protect)?;
+    plain.min_depth = None;
+    candidates.push((None, script.to_vec(), plain));
+    for &t in CANDIDATE_MIN_DEPTHS.iter().rev() {
+        let (out, stats) = anchor(script, t, protect)?;
+        candidates.push((Some(t), out, stats));
+    }
+    // compress each distinct script once
+    let mut distinct: Vec<usize> = Vec::new();
+    let of: Vec<usize> = (0..candidates.len())
+        .map(|i| match distinct.iter().position(|&j| candidates[j].1 == candidates[i].1) {
+            Some(k) => k,
+            None => {
+                distinct.push(i);
+                distinct.len() - 1
+            }
+        })
+        .collect();
+    let at_once = std::thread::available_parallelism().map_or(1, |n| (n.get() / 3).max(1));
+    let mut sizes = Vec::with_capacity(distinct.len());
+    for batch in distinct.chunks(at_once) {
+        let results: Vec<Result<usize, String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|&i| {
+                    let script = &candidates[i].1;
+                    s.spawn(move || crate::compress(script, protect).map(|(c, _)| c.len()).map_err(|e| e.to_string()))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("compression thread panicked")).collect()
+        });
+        for r in results {
+            sizes.push(r?);
+        }
+    }
+    let tried: Vec<(Option<u64>, usize)> = candidates.iter().zip(&of).map(|(c, &k)| (c.0, sizes[k])).collect();
+    let best = (0..candidates.len()).min_by_key(|&i| (sizes[of[i]], i)).expect("candidates");
+    let (_, out, stats) = candidates.swap_remove(best);
+    Ok((out, stats, tried))
 }
 
 /// The only witness item count with which the script can succeed, if the stack analysis proves there is one, and
@@ -118,29 +181,5 @@ fn provable(script: &[u8]) -> Result<(u64, Analysis), String> {
             "paths end at {} different stack depths, so more than one witness item count can succeed",
             ends.len()
         )),
-    }
-}
-
-/// The number a push instruction pushes, if it fits 64 bits.
-fn number(push: &[u8]) -> Option<u64> {
-    let data = match Opcode::from_u8(push[0]).class() {
-        Class::PushNum(n) => return Some(n.into()),
-        Class::PushBytes(n) => &push[push.len() - n as usize..],
-        Class::PushData(width) => &push[1 + width as usize..],
-        _ => return None,
-    };
-    data.iter().skip(8).all(|&b| b == 0).then(|| data.iter().take(8).rev().fold(0, |n, &b| n << 8 | b as u64))
-}
-
-/// The minimal push of `n`: `OP_0`–`OP_16`, else its little-endian bytes without trailing zeros. The single byte
-/// 0x81 takes a direct push, as `OP_1NEGATE` is an OP_SUCCESSx in Tapleaf 0xC2.
-fn minimal_push(n: u64) -> Vec<u8> {
-    match n {
-        0 => vec![0x00],
-        1..=16 => vec![0x50 + n as u8],
-        _ => {
-            let len = 8 - n.leading_zeros() as usize / 8;
-            [&[len as u8][..], &n.to_le_bytes()[..len]].concat()
-        }
     }
 }

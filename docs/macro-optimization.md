@@ -187,8 +187,9 @@ literal, mostly depth operands that occur in no repeat worth a declaration.
 A deep read `<d> PICK` names its value by its depth `d`, which changes whenever the stack above it grows or
 shrinks, so reads of the same value rarely repeat. Its index from the bottom, `H − d − 1` at stack height `H`, stays
 the same while the value stays put. `gsr anchor` rewrites each read `<d> PICK|ROLL` of the main script with
-`d ≥ 320` (`--min-depth`) as `DEPTH <H − d> SUB PICK|ROLL`, with `H − d` pushed minimally (a direct push for 0x81,
-as `OP_1NEGATE` is an OP_SUCCESSx). The script grows, and compresses much better:
+`d` at least a threshold (`--min-depth`) as `DEPTH <H − d> SUB PICK|ROLL`, with `H − d` pushed minimally (a direct
+push for 0x81, as `OP_1NEGATE` is an OP_SUCCESSx). The script grows, and compresses much better; with the
+threshold 320 the generator used:
 
 | Script | plain | anchored | compressed | anchored, compressed |
 |---|---:|---:|---:|---:|
@@ -214,13 +215,28 @@ failing witness fails.
 On the three verifier scripts `gsr anchor` rewrites every read the generator anchored (8,472–8,479) and gives its
 anchored scripts byte for byte.
 
+**Threshold.** A read less than 256 deep pushes its depth in one byte, so anchoring it costs 3 bytes more and
+rarely pays; a deeper one pays when its value is read often enough from other heights. The best threshold depends
+on the script, and the compressed size is not smooth in it. On the RISC Zero verifier at gsr-stark-verifier
+`3000b00` (148,486 bytes plain; 60,966 compressed without anchoring):
+
+| threshold | 192 | 224 | **256** | 288 | 320 | 384 | 512 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| compressed | 50,086 | 49,397 | **48,776** | 49,102 | 49,101 | 49,307 | 49,054 |
+
+Choosing per value instead (anchoring only the reads of slots read often) did not do better than the best threshold
+(within 13 bytes). So by default (`--min-depth auto`) `gsr anchor` compresses the script anchored with each of these
+thresholds, and not anchored, and keeps the smallest; on a tie, the fewest rewrites. That takes about six
+times as long as one compression (two minutes for this script on 14 cores); the result is deterministic.
+
 ## Reproduce
 
 The comparison of optimizers used gsr-stark-verifier's `macro_benchmark.py`.
 
 ```sh
-gsr anchor script.hex -o anchored.hex
+gsr anchor script.hex -o anchored.hex # the best threshold; --min-depth N for a given one
 gsr compress anchored.hex -o out.hex
 gsr check out.hex                     # witness item count, errors
 gsr info --bounds out.hex             # unrolling charge, distinct-instruction and LZ lower bounds
+gsr near-duplicates anchored.hex      # what would compress if a pushed depth or offset agreed
 ```
