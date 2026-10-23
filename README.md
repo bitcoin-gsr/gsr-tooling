@@ -72,3 +72,6 @@ cargo test
 GSR_REFERENCE_DIR=dir cargo test --release -- --ignored   # larger reference scripts, see tests/reference.rs
 contrib/extract-core.py ~/bitcoin [commit]                # refresh tests/data/core from Bitcoin Core
 ```
+
+`contrib/bip441-vectors/` generates the BIP 441 test vector files for the bips repository and Bitcoin Core; see its
+README.
